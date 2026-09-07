@@ -1,0 +1,124 @@
+name: Check and publish dsh runtime
+
+on:
+  schedule:
+    # 13:00 Asia/Shanghai = 05:00 UTC
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional @deepseek-ai/dsh version override'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Resolve latest version
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          recorded=$(node -p "require('./package.json').dependencies['@deepseek-ai/dsh']")
+          latest="${REQUESTED_VERSION:-$(npm view @deepseek-ai/dsh version)}"
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$recorded" = "$latest" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update recorded version
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          LATEST: ${{ steps.resolve.outputs.version }}
+        run: |
+          node -e "const fs=require('fs'); const p=require('./package.json'); p.dependencies['@deepseek-ai/dsh']=process.env.LATEST; fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\\n')"
+
+      - name: Update lockfile
+        if: steps.resolve.outputs.changed == 'true'
+        run: pnpm install --lockfile-only --no-frozen-lockfile
+
+      - name: Commit recorded version
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add package.json pnpm-lock.yaml
+          git commit -m "chore: update dsh runtime to ${{ steps.resolve.outputs.version }}"
+          git push
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            arch: x64
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Build runtime archive
+        env:
+          DSH_VERSION: ${{ needs.resolve.outputs.version }}
+          RUNTIME_PLATFORM: ${{ matrix.platform }}
+          RUNTIME_ARCH: ${{ matrix.arch }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node scripts/package-runtime.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-runtime-${{ matrix.platform }}-${{ matrix.arch }}
+          path: runtime-dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: runtime-dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          gh release create "dsh-runtime-${VERSION}" runtime-dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "dsh runtime ${VERSION}" \
+            --notes "Automated runtime bundle for @deepseek-ai/dsh ${VERSION}."
