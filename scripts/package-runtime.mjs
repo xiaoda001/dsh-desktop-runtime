@@ -25,10 +25,16 @@ const manifestName = `latest-${platform}-${arch}.json`
 if (existsSync(target)) rmSync(target, { recursive: true, force: true })
 mkdirSync(target, { recursive: true })
 writeFileSync(join(target, 'package.json'), JSON.stringify({ name: 'dsh-runtime', private: true, dependencies: { '@deepseek-ai/dsh': version } }, null, 2))
-execFileSync('pnpm', ['install', '--no-frozen-lockfile', '--node-linker=hoisted', '--ignore-scripts'], { cwd: target, stdio: 'inherit' })
+// dsh depends on platform-specific packages such as node-pty, sharp and
+// ripgrep. Their install hooks are required to fetch/build the native bits.
+execFileSync('pnpm', ['install', '--no-frozen-lockfile', '--node-linker=hoisted'], { cwd: target, stdio: 'inherit' })
 
 const marker = join(target, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 if (!existsSync(marker)) throw new Error(`runtime 不完整: ${marker}`)
+
+// Checking that the file exists is not enough: verify that Node can load the
+// published CLI entry point and resolve its dependency graph on this runner.
+execFileSync(process.execPath, [marker, '--help'], { cwd: target, stdio: 'inherit' })
 
 mkdirSync(outputDir, { recursive: true })
 if (existsSync(archive)) rmSync(archive, { force: true })
